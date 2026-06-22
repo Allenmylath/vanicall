@@ -1,0 +1,44 @@
+# fly.toml — Fly.io app configuration for vanicall
+# Run `fly launch --no-deploy` once to set your app name & region, or edit below.
+
+app = "vanicall"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+  RUST_LOG = "info,tower_http=info"
+  # Reconciler: loop forever, one pass every 10 minutes. Remove this var to make
+  # the reconciler one-shot instead (e.g. for a Fly scheduled machine / cron).
+  RECONCILE_INTERVAL_SECS = "600"
+  # Wait 5 min after a call ends before trusting Cloudflare's (delayed) analytics.
+  RECONCILE_SETTLE_SECS = "300"
+
+# Two process groups from the same image:
+#   web        -> the signaling/REST server (vanicall)
+#   reconciler -> the billing reconciler (reconcile)
+[processes]
+  web = "vanicall"
+  reconciler = "reconcile"
+
+# Only the web process serves HTTP.
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ["web"]
+
+  [[http_service.checks]]
+    interval = "15s"
+    timeout = "2s"
+    grace_period = "10s"
+    method = "GET"
+    path = "/health"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
