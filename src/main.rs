@@ -135,6 +135,19 @@ impl Presence {
         }
     }
 
+    /// Fan out an opaque payload to everyone in a room. Used for E2EE control messages: the
+    /// server never parses or stores `payload`, it only relays it. `origin` is the sender's
+    /// cf_session_id so their own forwarder skips the echo.
+    fn relay(&self, room_id: &str, origin: &str, payload: String) {
+        let rooms = self.rooms.lock().unwrap();
+        if let Some(room) = rooms.get(room_id) {
+            let _ = room.tx.send(PresenceEvent {
+                origin: origin.to_string(),
+                payload,
+            });
+        }
+    }
+
     /// Remove a member, announce the departure, and drop the room if now empty.
     fn leave(&self, room_id: &str, cf_session_id: &str) {
         let mut rooms = self.rooms.lock().unwrap();
@@ -390,10 +403,11 @@ async fn ws_handler(
     let token = headers
         .get("sec-websocket-protocol")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+        .unwrap_or("")
+        .to_string();
 
     // 2. Validate JWT
-    let claims = match validate_jwt(token, &state.config.jwt_secret) {
+    let claims = match validate_jwt(&token, &state.config.jwt_secret) {
         Ok(claims) => claims,
         Err(_) => {
             return axum::response::Response::builder()
@@ -403,8 +417,12 @@ async fn ws_handler(
         }
     };
 
-    // 3. Upgrade to WebSocket
-    ws.on_upgrade(move |socket| handle_socket(socket, state, claims))
+    // 3. Upgrade to WebSocket. We MUST echo the offered subprotocol back: a
+    // browser that opened `new WebSocket(url, token)` rejects the handshake if
+    // the server's 101 response doesn't confirm a subprotocol, closing the
+    // socket right after connecting. Echoing the token satisfies that rule.
+    ws.protocols([token])
+        .on_upgrade(move |socket| handle_socket(socket, state, claims))
 }
 
 async fn handle_socket(socket: WebSocket, state: AppState, claims: Claims) {
@@ -557,6 +575,22 @@ async fn handle_socket(socket: WebSocket, state: AppState, claims: Claims) {
                     }
                 }
                 let _ = out_tx.send(Message::Text(reply.to_string()));
+            }
+
+            // End-to-end encryption control messages. The server is a zero-trust relay: it
+            // never parses `msg`, only fans it out to the rest of the room, stamping the
+            // authoritative sender so clients can't spoof `from`. MLS ordering is preserved by
+            // the per-room broadcast channel.
+            Some("e2ee_relay") => {
+                if let Some(rid) = &room_id {
+                    let payload = serde_json::json!({
+                        "action": "e2ee_relay",
+                        "from": cf_session_id,
+                        "msg": json_msg.get("msg").cloned().unwrap_or(serde_json::Value::Null),
+                    })
+                    .to_string();
+                    state.presence.relay(rid, &cf_session_id, payload);
+                }
             }
 
             _ => {
