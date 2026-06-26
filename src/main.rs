@@ -16,7 +16,7 @@ use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::collections::HashMap;
 use std::env;
 use std::sync::{Arc, Mutex};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
 
@@ -67,18 +67,24 @@ struct MemberInfo {
     tracks: Vec<String>,
 }
 
-/// A presence event fanned out to everyone in a room. `origin` is the
-/// cf_session_id of the member the event is about, so a member's own forwarder
-/// can skip echoing events back to itself.
-#[derive(Clone)]
-struct PresenceEvent {
-    origin: String,
-    payload: String,
+struct Room {
+    members: HashMap<String, MemberInfo>, // keyed by cf_session_id
+    // Per-member delivery channel (the member's socket-writer queue). Fan-out pushes directly here
+    // rather than through a lossy broadcast bus: MLS control messages (Welcome/Commit) MUST NOT be
+    // dropped, or a peer never keys and is stuck "negotiating" forever. Unbounded + FIFO per
+    // recipient guarantees reliable, ordered delivery, which is what the E2EE handshake relies on.
+    senders: HashMap<String, mpsc::UnboundedSender<Message>>,
 }
 
-struct Room {
-    tx: broadcast::Sender<PresenceEvent>,
-    members: HashMap<String, MemberInfo>, // keyed by cf_session_id
+impl Room {
+    /// Send a pre-serialized payload to every member except `origin`.
+    fn fanout(&self, origin: &str, payload: &str) {
+        for (sid, tx) in &self.senders {
+            if sid != origin {
+                let _ = tx.send(Message::Text(payload.to_string()));
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -87,17 +93,22 @@ struct Presence {
 }
 
 impl Presence {
-    /// Add a member to a room. Returns the existing roster (for the newcomer)
-    /// and a receiver for future events. Announces the join to everyone else.
-    fn join(&self, room_id: &str, member: MemberInfo) -> (Vec<MemberInfo>, broadcast::Receiver<PresenceEvent>) {
+    /// Add a member to a room. Returns the existing roster (for the newcomer). `tx` is the
+    /// member's socket-writer queue, registered for reliable fan-out. Announces the join to
+    /// everyone else.
+    fn join(
+        &self,
+        room_id: &str,
+        member: MemberInfo,
+        tx: mpsc::UnboundedSender<Message>,
+    ) -> Vec<MemberInfo> {
         let mut rooms = self.rooms.lock().unwrap();
         let room = rooms.entry(room_id.to_string()).or_insert_with(|| Room {
-            tx: broadcast::channel(256).0,
             members: HashMap::new(),
+            senders: HashMap::new(),
         });
 
         let existing: Vec<MemberInfo> = room.members.values().cloned().collect();
-        let rx = room.tx.subscribe();
 
         let payload = serde_json::json!({
             "action": "peer_joined",
@@ -106,13 +117,11 @@ impl Presence {
             "tracks": member.tracks,
         })
         .to_string();
-        let _ = room.tx.send(PresenceEvent {
-            origin: member.cf_session_id.clone(),
-            payload,
-        });
+        room.fanout(&member.cf_session_id, &payload);
 
+        room.senders.insert(member.cf_session_id.clone(), tx);
         room.members.insert(member.cf_session_id.clone(), member);
-        (existing, rx)
+        existing
     }
 
     /// Record a member's published tracks and announce them to the room.
@@ -128,23 +137,17 @@ impl Presence {
                 "tracks": tracks,
             })
             .to_string();
-            let _ = room.tx.send(PresenceEvent {
-                origin: cf_session_id.to_string(),
-                payload,
-            });
+            room.fanout(cf_session_id, &payload);
         }
     }
 
     /// Fan out an opaque payload to everyone in a room. Used for E2EE control messages: the
     /// server never parses or stores `payload`, it only relays it. `origin` is the sender's
-    /// cf_session_id so their own forwarder skips the echo.
+    /// cf_session_id so the echo is skipped.
     fn relay(&self, room_id: &str, origin: &str, payload: String) {
         let rooms = self.rooms.lock().unwrap();
         if let Some(room) = rooms.get(room_id) {
-            let _ = room.tx.send(PresenceEvent {
-                origin: origin.to_string(),
-                payload,
-            });
+            room.fanout(origin, &payload);
         }
     }
 
@@ -153,15 +156,13 @@ impl Presence {
         let mut rooms = self.rooms.lock().unwrap();
         if let Some(room) = rooms.get_mut(room_id) {
             room.members.remove(cf_session_id);
+            room.senders.remove(cf_session_id);
             let payload = serde_json::json!({
                 "action": "peer_left",
                 "cf_session_id": cf_session_id,
             })
             .to_string();
-            let _ = room.tx.send(PresenceEvent {
-                origin: cf_session_id.to_string(),
-                payload,
-            });
+            room.fanout(cf_session_id, &payload);
             if room.members.is_empty() {
                 rooms.remove(room_id);
             }
@@ -500,7 +501,6 @@ async fn handle_socket(socket: WebSocket, state: AppState, claims: Claims) {
 
     // Set once the client joins a room; presence events flow only after that.
     let mut room_id: Option<String> = None;
-    let mut forwarder: Option<tokio::task::JoinHandle<()>> = None;
 
     while let Some(Ok(msg)) = ws_stream.next().await {
         let Message::Text(text) = msg else { continue };
@@ -527,7 +527,9 @@ async fn handle_socket(socket: WebSocket, state: AppState, claims: Claims) {
                     cf_session_id: cf_session_id.clone(),
                     tracks: Vec::new(),
                 };
-                let (existing, mut rx) = state.presence.join(rid, member);
+                // Register our socket-writer queue so the room can deliver presence/relay events
+                // straight to us (lossless, FIFO) — no separate forwarder task or broadcast bus.
+                let existing = state.presence.join(rid, member, out_tx.clone());
 
                 // Send the current roster (excludes self).
                 let _ = out_tx.send(Message::Text(
@@ -541,25 +543,6 @@ async fn handle_socket(socket: WebSocket, state: AppState, claims: Claims) {
                     })
                     .to_string(),
                 ));
-
-                // Forward future room events to this client (skipping our own).
-                let fwd_tx = out_tx.clone();
-                let me = cf_session_id.clone();
-                forwarder = Some(tokio::spawn(async move {
-                    loop {
-                        match rx.recv().await {
-                            Ok(ev) => {
-                                if ev.origin != me
-                                    && fwd_tx.send(Message::Text(ev.payload)).is_err()
-                                {
-                                    break;
-                                }
-                            }
-                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                            Err(broadcast::error::RecvError::Closed) => break,
-                        }
-                    }
-                }));
 
                 room_id = Some(rid.to_string());
             }
@@ -603,9 +586,6 @@ async fn handle_socket(socket: WebSocket, state: AppState, claims: Claims) {
     // --- Cleanup on disconnect ---
     if let Some(rid) = &room_id {
         state.presence.leave(rid, &cf_session_id);
-    }
-    if let Some(f) = forwarder {
-        f.abort();
     }
     writer.abort();
 
@@ -709,6 +689,38 @@ async fn handle_signal(
             }
         }
 
+        // Stop pulling remote tracks (e.g. a peer left the visible "stage"). The client sets the
+        // relevant transceivers inactive and sends an offer; CF closes the tracks server-side —
+        // which is what actually frees the egress we'd otherwise pay for — and answers. Direction
+        // mirrors `publish` (client offers, CF answers).
+        Some("unsubscribe") => {
+            let sdp = msg["sdp"].as_str().unwrap_or_default();
+            let tracks: Vec<serde_json::Value> = msg["tracks"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|t| Some(serde_json::json!({ "mid": t["mid"].as_str()? })))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let body = serde_json::json!({
+                "tracks": tracks,
+                "sessionDescription": { "type": "offer", "sdp": sdp },
+                "force": false,
+            });
+
+            match cf_tracks_close(config, cf_session_id, body).await {
+                Ok(resp) => serde_json::json!({
+                    "action": "unsubscribe_answer",
+                    "sessionDescription": resp["sessionDescription"],
+                    "requiresImmediateRenegotiation": resp["requiresImmediateRenegotiation"],
+                    "tracks": resp["tracks"],
+                }),
+                Err(e) => serde_json::json!({ "error": format!("unsubscribe failed: {e}") }),
+            }
+        }
+
         // Complete a renegotiation: client sends its answer.
         Some("renegotiate") => {
             let sdp = msg["sdp"].as_str().unwrap_or_default();
@@ -782,6 +794,19 @@ async fn cf_tracks_new(
         config.cf_app_id, session_id
     );
     cf_send(config, reqwest::Method::POST, &url, Some(body)).await
+}
+
+/// PUT /apps/{appId}/sessions/{sessionId}/tracks/close — stop sending/receiving the given tracks.
+async fn cf_tracks_close(
+    config: &Config,
+    session_id: &str,
+    body: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let url = format!(
+        "{CF_SFU_BASE}/apps/{}/sessions/{}/tracks/close",
+        config.cf_app_id, session_id
+    );
+    cf_send(config, reqwest::Method::PUT, &url, Some(body)).await
 }
 
 /// PUT /apps/{appId}/sessions/{sessionId}/renegotiate — finish renegotiation.
