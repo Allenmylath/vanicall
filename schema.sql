@@ -32,6 +32,12 @@ CREATE TABLE IF NOT EXISTS rooms (
 -- Drop the obsolete per-room session column on existing databases.
 ALTER TABLE rooms DROP COLUMN IF EXISTS cf_session_id;
 
+-- Room ownership + soft-delete, so a host can list and remove their own rooms.
+-- `owner_user_id` is nullable for legacy rooms created before ownership existed.
+ALTER TABLE rooms ADD COLUMN IF NOT EXISTS owner_user_id UUID REFERENCES users(id);
+ALTER TABLE rooms ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS idx_rooms_owner ON rooms (owner_user_id) WHERE deleted_at IS NULL;
+
 -- One row per WebSocket/signaling connection (i.e. one call session).
 -- The signaling server only fills in user_id, cf_session_id, started_at, ended_at.
 -- The byte columns are filled in later by the reconciler from Cloudflare's
@@ -49,6 +55,12 @@ CREATE TABLE IF NOT EXISTS sessions (
     ended_at      TIMESTAMPTZ,                       -- NULL while the session is still open
     reconciled_at TIMESTAMPTZ                        -- set once billed; guarantees bill-once
 );
+
+-- Tie a session to the room it joined and capture the display name shown to peers
+-- (this is what records guest names in a host's call history).
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS room_id UUID REFERENCES rooms(id);
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS display_name TEXT;
+CREATE INDEX IF NOT EXISTS idx_sessions_room_id ON sessions (room_id);
 
 CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions (user_id);
 -- Lets the reconciler cheaply find ended-but-unbilled sessions.

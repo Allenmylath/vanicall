@@ -1,11 +1,11 @@
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        State,
+        Path, State,
     },
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use chrono::{Duration, Utc};
@@ -243,7 +243,9 @@ async fn main() {
     let app = Router::new()
         .route("/health", get(health))
         .route("/login", post(login))
-        .route("/rooms", post(create_room))
+        .route("/rooms", get(list_rooms).post(create_room))
+        .route("/rooms/:id", delete(delete_room))
+        .route("/rooms/:id/sessions", get(room_sessions))
         .route("/usage", get(get_usage))
         .route("/ws", get(ws_handler))
         .layer(cors)
@@ -323,19 +325,201 @@ async fn login(
 // (handle_socket), not per-room.
 async fn create_room(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<CreateRoomRequest>,
-) -> impl IntoResponse {
-    let room_id = Uuid::new_v4();
+) -> axum::response::Response {
+    // Creating (hosting) a room requires auth; the creator becomes the owner.
+    let owner_id = match authed_user_id(&headers, &state.config.jwt_secret) {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
 
-    sqlx::query("INSERT INTO rooms (id, name) VALUES ($1, $2)")
+    let room_id = Uuid::new_v4();
+    if let Err(e) = sqlx::query("INSERT INTO rooms (id, name, owner_user_id) VALUES ($1, $2, $3)")
         .bind(room_id)
         .bind(&payload.name)
+        .bind(owner_id)
         .execute(&state.db)
         .await
-        .unwrap();
+    {
+        tracing::error!("create_room failed: {e}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "could not create room" })),
+        )
+            .into_response();
+    }
 
-    Json(RoomResponse {
-        room_id: room_id.to_string(),
+    Json(RoomResponse { room_id: room_id.to_string() }).into_response()
+}
+
+/// List the rooms owned by the authenticated user, with a little call history rollup.
+async fn list_rooms(State(state): State<AppState>, headers: HeaderMap) -> axum::response::Response {
+    let owner_id = match authed_user_id(&headers, &state.config.jwt_secret) {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
+
+    let rows = sqlx::query_as::<_, (Uuid, String, String, i64, Option<String>)>(
+        "SELECT r.id, r.name, r.created_at::text, \
+                COUNT(s.id) AS session_count, MAX(s.started_at)::text AS last_active \
+         FROM rooms r LEFT JOIN sessions s ON s.room_id = r.id \
+         WHERE r.owner_user_id = $1 AND r.deleted_at IS NULL \
+         GROUP BY r.id, r.name, r.created_at \
+         ORDER BY COALESCE(MAX(s.started_at), r.created_at) DESC",
+    )
+    .bind(owner_id)
+    .fetch_all(&state.db)
+    .await;
+
+    match rows {
+        Ok(rows) => {
+            let rooms: Vec<_> = rows
+                .into_iter()
+                .map(|(id, name, created_at, session_count, last_active)| {
+                    serde_json::json!({
+                        "room_id": id.to_string(),
+                        "name": name,
+                        "created_at": created_at,
+                        "session_count": session_count,
+                        "last_active": last_active,
+                    })
+                })
+                .collect();
+            Json(serde_json::json!({ "rooms": rooms })).into_response()
+        }
+        Err(e) => {
+            tracing::error!("list_rooms failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "could not list rooms" })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Soft-delete a room the caller owns. Idempotent; only the owner can delete.
+async fn delete_room(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    let owner_id = match authed_user_id(&headers, &state.config.jwt_secret) {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
+    let Ok(room_id) = Uuid::parse_str(&id) else {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "invalid room id" }))).into_response();
+    };
+
+    let res = sqlx::query(
+        "UPDATE rooms SET deleted_at = now() \
+         WHERE id = $1 AND owner_user_id = $2 AND deleted_at IS NULL",
+    )
+    .bind(room_id)
+    .bind(owner_id)
+    .execute(&state.db)
+    .await;
+
+    match res {
+        Ok(r) if r.rows_affected() > 0 => Json(serde_json::json!({ "deleted": true })).into_response(),
+        Ok(_) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "room not found or not yours" })),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("delete_room failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "could not delete room" })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Past sessions (call history) for a room the caller owns, including the display names that
+/// attended — which is how guest names are surfaced after the fact.
+async fn room_sessions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    let owner_id = match authed_user_id(&headers, &state.config.jwt_secret) {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
+    let Ok(room_id) = Uuid::parse_str(&id) else {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "invalid room id" }))).into_response();
+    };
+
+    // Ownership check before exposing any history.
+    let owns: Option<(Uuid,)> =
+        sqlx::query_as("SELECT id FROM rooms WHERE id = $1 AND owner_user_id = $2 AND deleted_at IS NULL")
+            .bind(room_id)
+            .bind(owner_id)
+            .fetch_optional(&state.db)
+            .await
+            .unwrap_or(None);
+    if owns.is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "room not found or not yours" })),
+        )
+            .into_response();
+    }
+
+    let rows = sqlx::query_as::<_, (Option<String>, Option<String>, String, Option<String>)>(
+        "SELECT display_name, cf_session_id, started_at::text, ended_at::text \
+         FROM sessions WHERE room_id = $1 ORDER BY started_at DESC",
+    )
+    .bind(room_id)
+    .fetch_all(&state.db)
+    .await;
+
+    match rows {
+        Ok(rows) => {
+            let sessions: Vec<_> = rows
+                .into_iter()
+                .map(|(display_name, cf_session_id, started_at, ended_at)| {
+                    serde_json::json!({
+                        "display_name": display_name,
+                        "cf_session_id": cf_session_id,
+                        "started_at": started_at,
+                        "ended_at": ended_at,
+                    })
+                })
+                .collect();
+            Json(serde_json::json!({ "sessions": sessions })).into_response()
+        }
+        Err(e) => {
+            tracing::error!("room_sessions failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "could not load sessions" })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Validate the bearer JWT and return the authenticated user's id, or an error response.
+fn authed_user_id(
+    headers: &HeaderMap,
+    secret: &str,
+) -> Result<Uuid, (StatusCode, Json<serde_json::Value>)> {
+    let token = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+    let claims = validate_jwt(token, secret).map_err(|_| {
+        (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "unauthorized" })))
+    })?;
+    Uuid::parse_str(&claims.sub).map_err(|_| {
+        (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "invalid token subject" })))
     })
 }
 
@@ -530,6 +714,22 @@ async fn handle_socket(socket: WebSocket, state: AppState, claims: Claims) {
                 // Register our socket-writer queue so the room can deliver presence/relay events
                 // straight to us (lossless, FIFO) — no separate forwarder task or broadcast bus.
                 let existing = state.presence.join(rid, member, out_tx.clone());
+
+                // Record which room this session joined + the display name shown to peers, so the
+                // owner's call history captures who attended (guests included).
+                if let Ok(rid_uuid) = Uuid::parse_str(rid) {
+                    if let Err(e) = sqlx::query(
+                        "UPDATE sessions SET room_id = $1, display_name = $2 WHERE id = $3",
+                    )
+                    .bind(rid_uuid)
+                    .bind(&user_name)
+                    .bind(billing_id)
+                    .execute(&state.db)
+                    .await
+                    {
+                        tracing::error!("failed to record room/display_name for session: {e}");
+                    }
+                }
 
                 // Send the current roster (excludes self).
                 let _ = out_tx.send(Message::Text(
