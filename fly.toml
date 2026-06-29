@@ -22,9 +22,12 @@ primary_region = 'bom'
 [http_service]
   internal_port = 8080
   force_https = true
+  # Keep exactly one web machine always running. The relay/roster state (Presence + per-room
+  # fan-out channels) is in-memory per process, so all members of a room MUST share one machine;
+  # a second web machine would split rooms and break the E2EE relay. Enforce with: fly scale count web=1.
   auto_stop_machines = 'stop'
   auto_start_machines = true
-  min_machines_running = 0
+  min_machines_running = 1
   processes = ['web']
 
   [[http_service.checks]]
@@ -34,6 +37,14 @@ primary_region = 'bom'
     method = 'GET'
     path = '/health'
 
+# Big single machine for the signaling/relay server.
+[[vm]]
+  size = 'performance-4x'
+  memory = '8gb'
+  processes = ['web']
+
+# The reconciler is a periodic background loop — keep it tiny.
 [[vm]]
   size = 'shared-cpu-1x'
   memory = '512mb'
+  processes = ['reconciler']
