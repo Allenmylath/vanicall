@@ -53,6 +53,10 @@ struct AppState {
     db: PgPool,
     config: Arc<Config>,
     presence: Arc<Presence>,
+    // Shared, pooled HTTP client for the Cloudflare SFU API. Reused across calls so each request
+    // doesn't pay a fresh TLS handshake, and bounded by a timeout so a stalled CF response can't
+    // wedge a signaling task forever. (reqwest::Client is internally Arc'd — cloning is cheap.)
+    http: reqwest::Client,
 }
 
 // --- Presence ---
@@ -226,10 +230,16 @@ async fn main() {
 
     tracing::info!("Connected to Postgres!");
 
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .expect("failed to build HTTP client");
+
     let state = AppState {
         db,
         config: Arc::new(config),
         presence: Arc::new(Presence::default()),
+        http,
     };
 
     // 2. Setup CORS so the frontend can talk to the API.
@@ -639,7 +649,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, claims: Claims) {
     // PeerConnection). We create it server-side so the client can never operate
     // on a session it doesn't own. We pass the user id as `correlationId` purely
     // for traceability in Cloudflare's tooling.
-    let cf_session_id = match cf_new_session(&state.config, &user_id.to_string()).await {
+    let cf_session_id = match cf_new_session(&state.http, &state.config, &user_id.to_string()).await {
         Ok(id) => id,
         Err(e) => {
             tracing::error!("failed to create CF session for {user_name}: {e}");
@@ -716,19 +726,25 @@ async fn handle_socket(socket: WebSocket, state: AppState, claims: Claims) {
                 let existing = state.presence.join(rid, member, out_tx.clone());
 
                 // Record which room this session joined + the display name shown to peers, so the
-                // owner's call history captures who attended (guests included).
+                // owner's call history captures who attended (guests included). Spawned: it's pure
+                // bookkeeping the client doesn't wait on, so it must not delay the roster (and thus
+                // the E2EE bootstrap that fires on it) or block the read loop on a DB round-trip.
                 if let Ok(rid_uuid) = Uuid::parse_str(rid) {
-                    if let Err(e) = sqlx::query(
-                        "UPDATE sessions SET room_id = $1, display_name = $2 WHERE id = $3",
-                    )
-                    .bind(rid_uuid)
-                    .bind(&user_name)
-                    .bind(billing_id)
-                    .execute(&state.db)
-                    .await
-                    {
-                        tracing::error!("failed to record room/display_name for session: {e}");
-                    }
+                    let db = state.db.clone();
+                    let display = user_name.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = sqlx::query(
+                            "UPDATE sessions SET room_id = $1, display_name = $2 WHERE id = $3",
+                        )
+                        .bind(rid_uuid)
+                        .bind(&display)
+                        .bind(billing_id)
+                        .execute(&db)
+                        .await
+                        {
+                            tracing::error!("failed to record room/display_name for session: {e}");
+                        }
+                    });
                 }
 
                 // Send the current roster (excludes self).
@@ -747,17 +763,31 @@ async fn handle_socket(socket: WebSocket, state: AppState, claims: Claims) {
                 room_id = Some(rid.to_string());
             }
 
-            // Signaling actions all target the server-owned cf_session_id.
+            // Signaling actions all target the server-owned cf_session_id. Each hits the Cloudflare
+            // API, which can take seconds — so we run it in a spawned task instead of awaiting it
+            // inline. Awaiting inline parks this connection's whole read loop, which would stall any
+            // following message (notably an `e2ee_relay` key package) behind the CF round-trip and
+            // leave a peer stuck "negotiating". The client serializes its own signaling (one
+            // outstanding request at a time), so spawning never races two CF mutations for a session.
             Some("publish") => {
-                let reply = handle_signal(&state.config, &cf_session_id, &json_msg).await;
-                // On a successful publish, announce our tracks to the room.
-                if reply.get("action").and_then(|a| a.as_str()) == Some("publish_answer") {
-                    if let Some(rid) = &room_id {
-                        let tracks = track_names(&json_msg);
-                        state.presence.publish(rid, &cf_session_id, tracks);
+                let http = state.http.clone();
+                let config = state.config.clone();
+                let presence = state.presence.clone();
+                let sid = cf_session_id.clone();
+                let rid = room_id.clone();
+                let req = json_msg.clone();
+                let tx = out_tx.clone();
+                tokio::spawn(async move {
+                    let reply = handle_signal(&http, &config, &sid, &req).await;
+                    // On a successful publish, announce our tracks to the room.
+                    if reply.get("action").and_then(|a| a.as_str()) == Some("publish_answer") {
+                        if let Some(rid) = &rid {
+                            let tracks = track_names(&req);
+                            presence.publish(rid, &sid, tracks);
+                        }
                     }
-                }
-                let _ = out_tx.send(Message::Text(reply.to_string()));
+                    let _ = tx.send(Message::Text(reply.to_string()));
+                });
             }
 
             // End-to-end encryption control messages. The server is a zero-trust relay: it
@@ -776,9 +806,18 @@ async fn handle_socket(socket: WebSocket, state: AppState, claims: Claims) {
                 }
             }
 
+            // subscribe / unsubscribe / renegotiate — same as publish, spawned so the CF round-trip
+            // never blocks this connection's read loop (see the note on `publish`).
             _ => {
-                let reply = handle_signal(&state.config, &cf_session_id, &json_msg).await;
-                let _ = out_tx.send(Message::Text(reply.to_string()));
+                let http = state.http.clone();
+                let config = state.config.clone();
+                let sid = cf_session_id.clone();
+                let req = json_msg.clone();
+                let tx = out_tx.clone();
+                tokio::spawn(async move {
+                    let reply = handle_signal(&http, &config, &sid, &req).await;
+                    let _ = tx.send(Message::Text(reply.to_string()));
+                });
             }
         }
     }
@@ -820,6 +859,7 @@ fn track_names(msg: &serde_json::Value) -> Vec<String> {
 ///   { "action": "subscribe",   "tracks": [{ "sessionId", "trackName" }] }   // remote tracks
 ///   { "action": "renegotiate", "sdp": "<answer>" }
 async fn handle_signal(
+    client: &reqwest::Client,
     config: &Config,
     cf_session_id: &str,
     msg: &serde_json::Value,
@@ -848,7 +888,7 @@ async fn handle_signal(
                 "tracks": tracks,
             });
 
-            match cf_tracks_new(config, cf_session_id, body).await {
+            match cf_tracks_new(client, config, cf_session_id, body).await {
                 Ok(resp) => serde_json::json!({
                     "action": "publish_answer",
                     "sessionDescription": resp["sessionDescription"],
@@ -878,7 +918,7 @@ async fn handle_signal(
 
             let body = serde_json::json!({ "tracks": tracks });
 
-            match cf_tracks_new(config, cf_session_id, body).await {
+            match cf_tracks_new(client, config, cf_session_id, body).await {
                 Ok(resp) => serde_json::json!({
                     "action": "subscribe_offer",
                     "sessionDescription": resp["sessionDescription"],
@@ -910,7 +950,7 @@ async fn handle_signal(
                 "force": false,
             });
 
-            match cf_tracks_close(config, cf_session_id, body).await {
+            match cf_tracks_close(client, config, cf_session_id, body).await {
                 Ok(resp) => serde_json::json!({
                     "action": "unsubscribe_answer",
                     "sessionDescription": resp["sessionDescription"],
@@ -927,7 +967,7 @@ async fn handle_signal(
             let body = serde_json::json!({
                 "sessionDescription": { "type": "answer", "sdp": sdp },
             });
-            match cf_renegotiate(config, cf_session_id, body).await {
+            match cf_renegotiate(client, config, cf_session_id, body).await {
                 Ok(()) => serde_json::json!({ "action": "renegotiated" }),
                 Err(e) => serde_json::json!({ "error": format!("renegotiate failed: {e}") }),
             }
@@ -955,13 +995,17 @@ fn validate_jwt(token: &str, secret: &str) -> Result<Claims, jsonwebtoken::error
 
 /// POST /apps/{appId}/sessions/new — create a new session (one per client).
 /// Body is optional; we send none. Returns the new `sessionId`.
-async fn cf_new_session(config: &Config, correlation_id: &str) -> Result<String, String> {
+async fn cf_new_session(
+    client: &reqwest::Client,
+    config: &Config,
+    correlation_id: &str,
+) -> Result<String, String> {
     let url = format!(
         "{CF_SFU_BASE}/apps/{}/sessions/new?correlationId={}",
         config.cf_app_id,
         urlencoding(correlation_id),
     );
-    let res = reqwest::Client::new()
+    let res = client
         .post(&url)
         .header("Authorization", format!("Bearer {}", config.cf_app_secret))
         .send()
@@ -985,6 +1029,7 @@ async fn cf_new_session(config: &Config, correlation_id: &str) -> Result<String,
 
 /// POST /apps/{appId}/sessions/{sessionId}/tracks/new — add local or remote tracks.
 async fn cf_tracks_new(
+    client: &reqwest::Client,
     config: &Config,
     session_id: &str,
     body: serde_json::Value,
@@ -993,11 +1038,12 @@ async fn cf_tracks_new(
         "{CF_SFU_BASE}/apps/{}/sessions/{}/tracks/new",
         config.cf_app_id, session_id
     );
-    cf_send(config, reqwest::Method::POST, &url, Some(body)).await
+    cf_send(client, config, reqwest::Method::POST, &url, Some(body)).await
 }
 
 /// PUT /apps/{appId}/sessions/{sessionId}/tracks/close — stop sending/receiving the given tracks.
 async fn cf_tracks_close(
+    client: &reqwest::Client,
     config: &Config,
     session_id: &str,
     body: serde_json::Value,
@@ -1006,11 +1052,12 @@ async fn cf_tracks_close(
         "{CF_SFU_BASE}/apps/{}/sessions/{}/tracks/close",
         config.cf_app_id, session_id
     );
-    cf_send(config, reqwest::Method::PUT, &url, Some(body)).await
+    cf_send(client, config, reqwest::Method::PUT, &url, Some(body)).await
 }
 
 /// PUT /apps/{appId}/sessions/{sessionId}/renegotiate — finish renegotiation.
 async fn cf_renegotiate(
+    client: &reqwest::Client,
     config: &Config,
     session_id: &str,
     body: serde_json::Value,
@@ -1019,17 +1066,18 @@ async fn cf_renegotiate(
         "{CF_SFU_BASE}/apps/{}/sessions/{}/renegotiate",
         config.cf_app_id, session_id
     );
-    cf_send(config, reqwest::Method::PUT, &url, Some(body)).await.map(|_| ())
+    cf_send(client, config, reqwest::Method::PUT, &url, Some(body)).await.map(|_| ())
 }
 
 /// Shared request helper for the authenticated JSON SFU endpoints.
 async fn cf_send(
+    client: &reqwest::Client,
     config: &Config,
     method: reqwest::Method,
     url: &str,
     body: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
-    let mut req = reqwest::Client::new()
+    let mut req = client
         .request(method, url)
         .header("Authorization", format!("Bearer {}", config.cf_app_secret));
     if let Some(b) = body {
