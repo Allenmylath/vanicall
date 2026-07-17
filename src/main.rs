@@ -850,8 +850,8 @@ async fn handle_socket(socket: WebSocket, state: AppState, claims: Claims) {
                 }
             }
 
-            // subscribe / unsubscribe / renegotiate — same as publish, spawned so the CF round-trip
-            // never blocks this connection's read loop (see the note on `publish`).
+            // subscribe / unsubscribe / update / renegotiate — same as publish, spawned so the CF
+            // round-trip never blocks this connection's read loop (see the note on `publish`).
             _ => {
                 let http = state.http.clone();
                 let config = state.config.clone();
@@ -1005,6 +1005,45 @@ async fn handle_signal(
             }
         }
 
+        // Change the simulcast layer the SFU forwards for already-pulled remote tracks (e.g. a tile
+        // shrank to a thumbnail, so request the low `q` layer). A remote pulled track is identified
+        // by location/sessionId/trackName/mid together (matching CF's own echo-simulcast example);
+        // no SDP, and no renegotiation for a preferredRid change — the SFU just switches layers.
+        Some("update") => {
+            let tracks: Vec<serde_json::Value> = msg["tracks"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|t| {
+                            let sc = &t["simulcast"];
+                            Some(serde_json::json!({
+                                "location": t["location"].as_str().unwrap_or("remote"),
+                                "sessionId": t["sessionId"].as_str()?,
+                                "trackName": t["trackName"].as_str()?,
+                                "mid": t["mid"].as_str()?,
+                                "simulcast": {
+                                    "preferredRid": sc["preferredRid"].as_str()?,
+                                    "priorityOrdering": sc["priorityOrdering"].as_str().unwrap_or("asciibetical"),
+                                    "ridNotAvailable": sc["ridNotAvailable"].as_str().unwrap_or("asciibetical"),
+                                },
+                            }))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let body = serde_json::json!({ "tracks": tracks });
+
+            match cf_tracks_update(client, config, cf_session_id, body).await {
+                Ok(resp) => serde_json::json!({
+                    "action": "update_result",
+                    "requiresImmediateRenegotiation": resp["requiresImmediateRenegotiation"],
+                    "tracks": resp["tracks"],
+                }),
+                Err(e) => serde_json::json!({ "error": format!("update failed: {e}") }),
+            }
+        }
+
         // Complete a renegotiation: client sends its answer.
         Some("renegotiate") => {
             let sdp = msg["sdp"].as_str().unwrap_or_default();
@@ -1094,6 +1133,21 @@ async fn cf_tracks_close(
 ) -> Result<serde_json::Value, String> {
     let url = format!(
         "{CF_SFU_BASE}/apps/{}/sessions/{}/tracks/close",
+        config.cf_app_id, session_id
+    );
+    cf_send(client, config, reqwest::Method::PUT, &url, Some(body)).await
+}
+
+/// PUT /apps/{appId}/sessions/{sessionId}/tracks/update — change a pulled track's simulcast layer.
+/// No SDP / renegotiation for a `preferredRid` change; the SFU just switches which layer it forwards.
+async fn cf_tracks_update(
+    client: &reqwest::Client,
+    config: &Config,
+    session_id: &str,
+    body: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let url = format!(
+        "{CF_SFU_BASE}/apps/{}/sessions/{}/tracks/update",
         config.cf_app_id, session_id
     );
     cf_send(client, config, reqwest::Method::PUT, &url, Some(body)).await
