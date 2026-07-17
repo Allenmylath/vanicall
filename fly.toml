@@ -22,12 +22,20 @@ primary_region = 'bom'
 [http_service]
   internal_port = 8080
   force_https = true
-  # Keep exactly one web machine always running. The relay/roster state (Presence + per-room
-  # fan-out channels) is in-memory per process, so all members of a room MUST share one machine;
-  # a second web machine would split rooms and break the E2EE relay. Enforce with: fly scale count web=1.
+  # Exactly ONE web machine may exist. The relay/roster state (Presence + per-room fan-out
+  # channels) is in-memory per process, so all members of a room MUST share one machine; a second
+  # web machine would split rooms and break the E2EE relay. Enforce with: fly scale count web=1.
+  # That invariant is about machine *count*, not uptime — autostart only ever wakes the one
+  # machine in the pool, so scaling to zero is compatible with it.
+  #
+  # min_machines_running = 0 is safe because the in-memory state only matters while someone is
+  # connected: no connections means no roster to lose. While a call IS live the socket heartbeat
+  # (see HEARTBEAT_INTERVAL in src/main.rs) puts a frame on the wire every 30s, so an idle call
+  # can never look like an idle machine. Cost: a cold start (~1-2s, plus Neon's own wake) on the
+  # first request after a quiet period.
   auto_stop_machines = 'stop'
   auto_start_machines = true
-  min_machines_running = 1
+  min_machines_running = 0
   processes = ['web']
 
   [[http_service.checks]]
@@ -37,10 +45,13 @@ primary_region = 'bom'
     method = 'GET'
     path = '/health'
 
-# Big single machine for the signaling/relay server.
+# Signaling/relay only: no media and no crypto touch this process (media goes browser->Cloudflare
+# SFU, MLS runs in the browser). Per-member state is a roster entry plus a channel, and the CF API
+# round-trips are spawned, so this is I/O-bound with episodic bursts — the profile shared CPU burst
+# is built for. Bump to performance-1x if throttling ever shows up as signaling jitter.
 [[vm]]
-  size = 'performance-4x'
-  memory = '8gb'
+  size = 'shared-cpu-2x'
+  memory = '1gb'
   processes = ['web']
 
 # The reconciler is a periodic background loop — keep it tiny.

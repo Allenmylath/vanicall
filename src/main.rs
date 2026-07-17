@@ -24,6 +24,16 @@ use uuid::Uuid;
 // NOTE: this is NOT api.cloudflare.com — that host is only for app management.
 const CF_SFU_BASE: &str = "https://rtc.live.cloudflare.com/v1";
 
+// WebSocket heartbeat. The browser WebSocket API gives pages no way to send pings, so a call where
+// everyone is merely listening produces zero inbound frames. Without a heartbeat a peer that
+// vanishes (laptop closed, network dropped) is only noticed when TCP eventually gives up — minutes
+// during which the roster still advertises a member other clients try to subscribe to.
+//
+// We ping every interval; if a ping is still unanswered when the next tick fires, the peer is gone.
+// Detection therefore takes between one and two intervals. Browsers reply to ping frames
+// automatically, so this needs no client-side support.
+const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
 // --- Configuration (loaded from environment) ---
 #[derive(Clone)]
 struct Config {
@@ -696,7 +706,41 @@ async fn handle_socket(socket: WebSocket, state: AppState, claims: Claims) {
     // Set once the client joins a room; presence events flow only after that.
     let mut room_id: Option<String> = None;
 
-    while let Some(Ok(msg)) = ws_stream.next().await {
+    // Heartbeat state. `interval`'s first tick resolves immediately, so consume it here rather than
+    // pinging the instant the socket opens.
+    let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+    heartbeat.tick().await;
+    let mut awaiting_pong = false;
+
+    loop {
+        let msg = tokio::select! {
+            incoming = ws_stream.next() => match incoming {
+                Some(Ok(m)) => m,
+                // Stream ended or errored: the peer is gone either way.
+                _ => break,
+            },
+            _ = heartbeat.tick() => {
+                if awaiting_pong {
+                    tracing::info!(
+                        "{} timed out (no pong within {}s, cf_session {})",
+                        user_name,
+                        HEARTBEAT_INTERVAL.as_secs(),
+                        cf_session_id
+                    );
+                    break;
+                }
+                awaiting_pong = true;
+                // A send error means the writer task is gone, i.e. the socket is already closed.
+                if out_tx.send(Message::Ping(Vec::new())).is_err() {
+                    break;
+                }
+                continue;
+            }
+        };
+
+        // Any inbound frame — pong, text, anything — proves the peer is still there.
+        awaiting_pong = false;
+
         let Message::Text(text) = msg else { continue };
         let Ok(json_msg) = serde_json::from_str::<serde_json::Value>(&text) else {
             continue;
