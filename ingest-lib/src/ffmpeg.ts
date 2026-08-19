@@ -75,6 +75,12 @@ export function buildFfmpegArgs(
   return args;
 }
 
+/**
+ * How long `stop()` waits for ffmpeg to wind down on its own before killing it. Generous, because
+ * the whole point of the graceful path is letting the WHIP DELETE reach the server.
+ */
+const STOP_GRACE_MS = 5000;
+
 /** A running ffmpeg publish. */
 export type Publish = {
   /** Resolves when ffmpeg exits cleanly; rejects with its stderr tail on a non-zero exit. */
@@ -97,7 +103,10 @@ export function spawnPublish(
   opts: EncodeOptions & { onLog?: (line: string) => void } = {},
 ): Publish {
   const args = buildFfmpegArgs(input, whipUrl, token, opts);
-  const child = spawn(opts.ffmpegPath ?? "ffmpeg", args, { stdio: ["ignore", "ignore", "pipe"] });
+  // stdin is a pipe so `stop()` can ask ffmpeg to quit gracefully — see below.
+  const child = spawn(opts.ffmpegPath ?? "ffmpeg", args, { stdio: ["pipe", "ignore", "pipe"] });
+
+  let stopping = false;
 
   const tail: string[] = [];
   child.stderr.setEncoding("utf8");
@@ -121,11 +130,37 @@ export function spawnPublish(
       ),
     );
     child.on("close", (code, signal) => {
-      // SIGINT/SIGTERM is how `stop()` ends a publish, so it is a clean exit here.
-      if (code === 0 || signal === "SIGINT" || signal === "SIGTERM") resolve();
+      // A requested stop is a clean exit however ffmpeg reports it — quitting via `q` does not
+      // reliably yield status 0.
+      if (stopping || code === 0 || signal === "SIGINT" || signal === "SIGTERM") resolve();
       else reject(new Error(`ffmpeg exited with code ${code}:\n${tail.join("\n")}`));
     });
   });
 
-  return { done, stop: () => child.kill("SIGINT") };
+  const stop = () => {
+    if (stopping) return;
+    stopping = true;
+    // `q` on stdin is ffmpeg's documented graceful quit, and it is the only portable one. It lets
+    // ffmpeg run its shutdown path, which for WHIP means sending the DELETE that drops the tile
+    // immediately instead of leaving a dead feed for the server's reaper to notice a minute later.
+    //
+    // Signals are not usable here: Node on Windows cannot deliver SIGINT, and `kill()` there
+    // terminates the process outright — ffmpeg never gets to send the DELETE.
+    try {
+      child.stdin.write("q");
+      child.stdin.end();
+    } catch {
+      // stdin already closed; fall through to the timer below.
+    }
+    const forceKill = setTimeout(() => {
+      try {
+        child.kill();
+      } catch {
+        // Already gone.
+      }
+    }, STOP_GRACE_MS);
+    child.once("close", () => clearTimeout(forceKill));
+  };
+
+  return { done, stop };
 }
