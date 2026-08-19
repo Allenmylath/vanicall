@@ -4,3 +4,5 @@
 /frontend
 /samplefrontend
 /transcript-backend
+ingest-lib/node_modules
+ingest-lib/dist

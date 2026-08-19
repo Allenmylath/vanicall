@@ -5,13 +5,19 @@ A Rust (axum) signaling/API server for WebRTC calls backed by the
 
 ## Endpoints
 
-| Method | Path      | Description                                    |
-| ------ | --------- | ---------------------------------------------- |
-| GET    | `/health` | Health check (used by Fly.io)                  |
-| POST   | `/login`  | Login/create user, returns a JWT               |
-| POST   | `/rooms`  | Create a (logical) room                        |
-| GET    | `/usage`  | Authed user's billed usage (Bearer token)      |
-| GET    | `/ws`     | WebSocket signaling (JWT)                      |
+| Method | Path                      | Description                                          |
+| ------ | ------------------------- | ---------------------------------------------------- |
+| GET    | `/health`                 | Health check (used by Fly.io)                        |
+| POST   | `/login`                  | Login/create user, returns a JWT                     |
+| POST   | `/rooms`                  | Create a (logical) room                              |
+| GET    | `/rooms/:id/config`       | Public room config (`name`, `e2ee`) — no auth        |
+| POST   | `/rooms/:id/ingests`      | Mint an external-source publish credential (owner)   |
+| GET    | `/rooms/:id/ingests`      | List a room's ingests (owner)                        |
+| DELETE | `/ingests/:id`            | Revoke an ingest, cutting off any live publish       |
+| POST   | `/whip/:ingest_id`        | WHIP publish — SDP offer in, SDP answer out          |
+| DELETE | `/whip/:ingest_id/:res`   | WHIP teardown                                        |
+| GET    | `/usage`                  | Authed user's billed usage (Bearer token)            |
+| GET    | `/ws`                     | WebSocket signaling (JWT)                            |
 
 ## Signaling protocol (`/ws`)
 
@@ -76,6 +82,54 @@ Typical flow: `join` → for each peer in `roster`/`peer_published`, send a
 room gets a `peer_published` and subscribes to you. Presence is in-memory per
 server instance — fine for a single Fly machine; for multiple `web` machines
 you'd back it with Redis/postgres `LISTEN`/NOTIFY.
+
+## External video ingest (WHIP)
+
+Non-browser sources — RTSP cameras, ffmpeg, OBS, file pumps — publish into a room
+over **WHIP**, so nothing has to implement the WebSocket protocol above. WHIP is
+one exchange (POST an SDP offer, get an SDP answer, DELETE to stop), which maps
+1:1 onto Cloudflare's `tracks/new` with `location: "local"`. Media flows encoder
+↔ Cloudflare directly; this server only relays SDP, exactly as it does for
+browsers.
+
+An ingest appears in the roster as a normal member with `"role": "ingest"`, and
+publishes as `mic` + `cam` (or `screen`) — the track names the web client
+subscribes to. Peers see it as another tile with no client-side changes.
+
+```bash
+# 1. Create a room that accepts external sources, and mint a credential for it.
+ROOM=$(curl -s -X POST "$API/rooms" -H "Authorization: Bearer $JWT" \
+  -H 'content-type: application/json' \
+  -d '{"name":"Front door","e2ee":false}' | jq -r .room_id)
+
+curl -s -X POST "$API/rooms/$ROOM/ingests" -H "Authorization: Bearer $JWT" \
+  -H 'content-type: application/json' -d '{"name":"Front door cam"}'
+# { "ingest_id": "...", "whip_url": "https://…/whip/<id>", "token": "…", "expires_at": "…" }
+
+# 2. Point any encoder at it. Requires ffmpeg 7.0+ (older builds have no WHIP muxer).
+ffmpeg -re -i rtsp://192.168.1.9/stream \
+  -c:v libx264 -profile:v baseline -tune zerolatency -bf 0 -g 60 -pix_fmt yuv420p \
+  -c:a libopus -ar 48000 -ac 2 -b:a 64k \
+  -f whip -authorization "$TOKEN" "$WHIP_URL"
+```
+
+[`ingest-lib/`](ingest-lib/) wraps both steps (`@vanicall/ingest`), including
+spawning ffmpeg with the right flags.
+
+**Ingest requires `e2ee: false` on the room.** An encoder cannot join the room's
+MLS group, and browsers drop frames they can't decrypt, so a plaintext publisher
+would render as static in every tile. `POST /rooms/:id/ingests` returns **409**
+for an encrypted room, so ingest can never silently downgrade one; the web client
+reads `GET /rooms/:id/config` before connecting and shows a "Not encrypted" badge.
+
+Ingest tokens are scoped to one room and one track name and expire after 30 days;
+only their SHA-256 is stored, so the plaintext is returned once at mint. Cloudflare
+usage is billed to the room owner via a normal `sessions` row.
+
+Because an encoder holds no connection to this server, a crashed one can't be
+detected the way the WebSocket heartbeat detects a vanished browser. A per-publish
+reaper polls Cloudflare's session state and tears the ingest down when it reports
+the session gone (`410`), with a hard max lifetime as a backstop.
 
 ## Billing (GB usage)
 
@@ -143,6 +197,9 @@ All secrets come from environment variables (see [`.env.example`](.env.example))
 - `CF_ACCOUNT_ID` — Cloudflare account id (reconciler / analytics only)
 - `CF_ANALYTICS_API_TOKEN` — Cloudflare token with **Account Analytics**
   permission (used by the reconciler only)
+- `PUBLIC_BASE_URL` — absolute origin this server is reachable at. Only used to
+  build the WHIP URL handed to encoders, which can't resolve a relative path.
+  Defaults to `https://vanicall.fly.dev`; set it for local dev or another host.
 - `PORT` — listen port (Fly.io sets this automatically; defaults to `8080`)
 - `RECONCILE_*` — reconciler tuning (see [`.env.example`](.env.example))
 

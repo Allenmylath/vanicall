@@ -38,6 +38,31 @@ ALTER TABLE rooms ADD COLUMN IF NOT EXISTS owner_user_id UUID REFERENCES users(i
 ALTER TABLE rooms ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS idx_rooms_owner ON rooms (owner_user_id) WHERE deleted_at IS NULL;
 
+-- Whether media in this room is end-to-end encrypted (MLS/SFrame in the browser client).
+-- Defaults to true so existing rooms keep today's behavior. It is turned OFF only for rooms that
+-- accept external ingest: an encoder pushing over WHIP cannot join the MLS group, and browsers
+-- drop unkeyed frames, so a plaintext publisher would render as garbage in every tile. The server
+-- refuses to mint an ingest for a room with e2ee = true, so ingest can never silently downgrade
+-- a room that peers believe is encrypted.
+ALTER TABLE rooms ADD COLUMN IF NOT EXISTS e2ee BOOLEAN NOT NULL DEFAULT true;
+
+-- External video ingest credentials. One row per publishing endpoint (a camera, an encoder, a
+-- file pump). The bearer token ends up in an ffmpeg command line or a device config field, so it
+-- is deliberately narrow — one room, one track name, with an expiry — rather than an account
+-- credential. Only the SHA-256 of the token is stored; the plaintext is returned once, at mint.
+CREATE TABLE IF NOT EXISTS ingests (
+    id         UUID PRIMARY KEY,
+    room_id    UUID NOT NULL REFERENCES rooms(id),
+    user_id    UUID NOT NULL REFERENCES users(id),   -- Cloudflare usage is billed to this user
+    name       TEXT NOT NULL,                        -- display name shown in the room roster
+    track_name TEXT NOT NULL DEFAULT 'cam',          -- must be 'cam' or 'screen' (see main.rs)
+    token_hash TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at TIMESTAMPTZ NOT NULL,
+    revoked_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_ingests_room ON ingests (room_id) WHERE revoked_at IS NULL;
+
 -- One row per WebSocket/signaling connection (i.e. one call session).
 -- The signaling server only fills in user_id, cf_session_id, started_at, ended_at.
 -- The byte columns are filled in later by the reconciler from Cloudflare's

@@ -1,6 +1,8 @@
 target
 .git
 .gitignore
+# Control-plane client library — published to npm, never part of the server image.
+ingest-lib
 .env
 .dockerignore
 Dockerfile
