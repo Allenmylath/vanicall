@@ -7,17 +7,20 @@
 #
 # Deploy from the REPO ROOT (the image needs ../ingest-lib):
 #   fly deploy -c ingest-worker/fly.toml --dockerfile ingest-worker/Dockerfile .
+#
+# The trailing `.` is load-bearing: it makes the repo root the build context, which the image needs
+# because it builds ingest-lib from source. There is deliberately no [build] section — that would
+# root the context at this directory instead, and the build would fail on the missing ingest-lib.
 
 app = 'vanicall-ingest'
 primary_region = 'bom'
 
-[build]
-  dockerfile = 'Dockerfile'
-
 [env]
   PORT = '8090'
   VANICALL_API_URL = 'https://vanicall.fly.dev'
-  MAX_JOBS = '4'
+  # Proportionate to the 1gb below: each concurrent stream is a real ffmpeg transcode. Raise this
+  # together with the VM, not on its own.
+  MAX_JOBS = '2'
 
 [http_service]
   internal_port = 8090
@@ -35,7 +38,11 @@ primary_region = 'bom'
     method = 'GET'
     path = '/health'
 
-# Each concurrent stream is a real ffmpeg transcode. Size for MAX_JOBS, not for idle.
+# Each concurrent stream is a real ffmpeg transcode, so size for MAX_JOBS rather than for idle.
+# Starts at the same shape as the signaling app, which is known to place in bom — shared-cpu-2x
+# with 2gb currently has no capacity there. Scale up once it is running and you need more streams:
+#   fly scale vm shared-cpu-4x --memory 2048 -a vanicall-ingest
+# and raise MAX_JOBS to match.
 [[vm]]
   size = 'shared-cpu-2x'
-  memory = '2gb'
+  memory = '1gb'

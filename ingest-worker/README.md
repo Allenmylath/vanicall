@@ -70,12 +70,25 @@ rejected with 409, so retrying is correct rather than an error.
 ## Deploying
 
 ```bash
-fly launch --no-deploy --copy-config -c ingest-worker/fly.toml --name vanicall-ingest
-fly secrets set -a vanicall-ingest JWT_SECRET="$(fly ssh console -a vanicall -C 'printenv JWT_SECRET')"
+# Create the app directly. `fly launch` reads the root fly.toml and runs a wizard that gets the
+# region and build context wrong for this app.
+fly apps create vanicall-ingest
+
+fly secrets set -a vanicall-ingest JWT_SECRET='<same secret the vanicall API signs with>'
+
+# From the REPO ROOT. The trailing `.` is load-bearing: the image builds ingest-lib from source,
+# so the context has to be the root, not this directory.
 fly deploy -c ingest-worker/fly.toml --dockerfile ingest-worker/Dockerfile .
 ```
 
-Deploy from the **repo root** — the image needs `../ingest-lib`.
+If deploy reports **`no capacity`**, the VM shape is unavailable in that region, not a config
+error. `shared-cpu-2x`/`1gb` (what this uses) is known to place in `bom`; larger shapes may not.
+Either pick another region with `fly deploy --region sin` (or `sin`/`nrt`/`fra`), or scale after a
+successful deploy:
+
+```bash
+fly scale vm shared-cpu-4x --memory 2048 -a vanicall-ingest   # then raise MAX_JOBS to match
+```
 
 ### ffmpeg version
 
