@@ -238,6 +238,25 @@ impl Presence {
             }
         }
     }
+
+    /// (humans, ingests) currently in a room. Used by the ingest worker to stop a stream once no
+    /// human is left to watch it, so a room full of only feeds doesn't keep a worker alive.
+    fn counts(&self, room_id: &str) -> (usize, usize) {
+        let rooms = self.rooms.lock().unwrap();
+        let Some(room) = rooms.get(room_id) else {
+            return (0, 0);
+        };
+        let mut humans = 0;
+        let mut ingests = 0;
+        for m in room.members.values() {
+            if m.role == ROLE_INGEST {
+                ingests += 1;
+            } else {
+                humans += 1;
+            }
+        }
+        (humans, ingests)
+    }
 }
 
 // --- Data Structures ---
@@ -349,6 +368,7 @@ async fn main() {
         .route("/rooms", get(list_rooms).post(create_room))
         .route("/rooms/:id", delete(delete_room))
         .route("/rooms/:id/config", get(room_config))
+        .route("/rooms/:id/presence", get(room_presence))
         .route("/rooms/:id/sessions", get(room_sessions))
         .route("/rooms/:id/ingests", get(list_ingests).post(create_ingest))
         .route("/ingests/:id", delete(revoke_ingest))
@@ -502,6 +522,29 @@ async fn room_config(
         )
             .into_response(),
     }
+}
+
+/// Live occupancy of a room: how many humans vs ingests are connected right now.
+///
+/// Unauthenticated, like `room_config` — the caller already holds the room id (a capability), and
+/// this returns only counts, no identities. The ingest worker polls it to decide whether a stream
+/// still has any human audience; a room with humans == 0 is one nobody is watching, so the worker
+/// can stop the feed and let itself scale down.
+///
+/// Counts come from the in-memory `Presence` roster, which lives only on the single web machine —
+/// the same machine every member of a room is pinned to — so it is authoritative.
+async fn room_presence(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    // Rooms are opaque strings to Presence, so no UUID parse is required; keep it lenient.
+    let (humans, ingests) = state.presence.counts(&id);
+    Json(serde_json::json!({
+        "room_id": id,
+        "humans": humans,
+        "ingests": ingests,
+    }))
+    .into_response()
 }
 
 /// List the rooms owned by the authenticated user, with a little call history rollup.

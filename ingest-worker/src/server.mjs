@@ -52,6 +52,19 @@ const IDLE_SHUTDOWN_MS = Number(process.env.IDLE_SHUTDOWN_MS ?? 5 * 60 * 1000);
 // Poll often enough to notice the idle window promptly, but never more than every 30s in prod.
 const IDLE_CHECK_MS = Math.max(1000, Math.min(30 * 1000, Math.floor(IDLE_SHUTDOWN_MS / 3) || 1000));
 
+/**
+ * Stop a stream once its room has had zero human viewers for this long. A room whose only members
+ * are feeds is one nobody is watching, so publishing into it just burns CPU and keeps the worker
+ * awake. The grace absorbs a viewer refreshing or briefly dropping. Set HUMANLESS_STOP_MS=0 to
+ * disable (a feed then runs until explicitly stopped, regardless of audience).
+ *
+ * Only applies to streams whose /publish carried a `roomId` (the UI always sends one). Without it
+ * the worker can't ask about the room, so the stream just runs — a safe default.
+ */
+const HUMANLESS_STOP_MS = Number(process.env.HUMANLESS_STOP_MS ?? 90 * 1000);
+// Poll frequently enough that the grace window is the thing that decides timing, not the interval.
+const PRESENCE_CHECK_MS = Math.max(1000, Math.min(20 * 1000, Math.floor(HUMANLESS_STOP_MS / 3) || 1000));
+
 /** jobId -> job */
 const jobs = new Map();
 
@@ -271,6 +284,9 @@ const server = http.createServer(async (req, res) => {
       restarts: 0,
       stopped: false,
       startedAt: nowIso(),
+      // Epoch ms since the room was first seen with no humans (null = humans present / not yet
+      // checked). When this exceeds HUMANLESS_STOP_MS the stream is stopped as unwatched.
+      humanlessSince: null,
     };
     jobs.set(job.jobId, job);
     markActive();
@@ -365,3 +381,44 @@ async function stopSelfIfIdle() {
 }
 
 setInterval(() => { void stopSelfIfIdle(); }, IDLE_CHECK_MS).unref();
+
+// ---------------- Stop streams nobody is watching ----------------
+
+/**
+ * For each live job that carried a roomId, ask the API how many humans are in that room. Once a
+ * room has been humanless for HUMANLESS_STOP_MS, stop the stream (a real stop — it will not
+ * restart), which then lets the worker go idle and scale down.
+ *
+ * A failed presence check is treated as "unknown", not "empty": the humanless timer resets, so a
+ * transient API blip never reaps a watched stream. Ingests are excluded from the count server-side,
+ * so a room containing only feeds correctly reads as zero humans.
+ */
+async function stopUnwatchedStreams() {
+  if (HUMANLESS_STOP_MS <= 0) return;
+
+  for (const job of jobs.values()) {
+    if (job.stopped || !job.roomId) continue;
+    try {
+      const r = await fetch(VANICALL_API_URL + "/rooms/" + encodeURIComponent(job.roomId) + "/presence");
+      if (!r.ok) { job.humanlessSince = null; continue; }
+      const { humans } = await r.json();
+
+      if (humans > 0) {
+        job.humanlessSince = null;
+        continue;
+      }
+      // No humans. Start (or continue) the countdown.
+      if (job.humanlessSince == null) job.humanlessSince = Date.now();
+      else if (Date.now() - job.humanlessSince >= HUMANLESS_STOP_MS) {
+        console.log("[" + job.jobId + "] no viewers for " + Math.round(HUMANLESS_STOP_MS / 1000) + "s — stopping");
+        stopJob(job);
+        setTimeout(() => jobs.delete(job.jobId), 60000);
+      }
+    } catch {
+      // Could not reach the API — treat as unknown, not empty.
+      job.humanlessSince = null;
+    }
+  }
+}
+
+setInterval(() => { void stopUnwatchedStreams(); }, PRESENCE_CHECK_MS).unref();

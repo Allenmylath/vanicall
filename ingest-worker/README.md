@@ -59,6 +59,23 @@ machine simply restarts — i.e. it will NOT scale down. Set `IDLE_SHUTDOWN_MS=0
 Cold start after an idle period is a few seconds (machine boot; the ffmpeg image layer is already
 cached), then the usual RTSP-connect time. The first `Stream` click after a quiet spell is slower.
 
+## Stops streams nobody is watching
+
+A stream whose room has **no human viewers** is one nobody is watching — publishing into it just
+burns CPU and keeps the worker awake. So the worker polls the API for each stream's room
+(`GET /rooms/:id/presence`, which counts humans vs ingests from the live roster) and stops a stream
+once its room has been humanless for `HUMANLESS_STOP_MS` (default 90s; the grace absorbs a viewer
+refreshing). With the last stream gone, the worker goes idle and scales down.
+
+This makes UI-initiated streams **viewer-driven**: when the last person leaves, the feed stops, and
+someone re-adds it when they return. Only streams whose `/publish` carried a `roomId` are managed
+this way (the UI always sends one); without it the stream runs until stopped. A failed presence
+check counts as "unknown", not "empty", so an API blip never reaps a watched stream.
+
+The headless SDK path (`@vanicall/ingest` `pushRtsp`) runs ffmpeg on the caller's own machine, not
+through this worker, so a deliberately-persistent feed is unaffected. Set `HUMANLESS_STOP_MS=0` to
+turn the behaviour off for a worker.
+
 ## Design
 
 Deliberately dumb. It knows nothing about rooms, ownership, or the database. The caller mints an
@@ -95,6 +112,9 @@ rejected with 409, so retrying is correct rather than an error.
 | `PORT` | `8090` | |
 | `ALLOWED_ORIGINS` | `*` | CORS; comma-separated. Tighten in production |
 | `MAX_JOBS` | `4` | Concurrent ffmpeg processes |
+| `HUMANLESS_STOP_MS` | `90000` | Stop a stream after its room has had no human viewers this long; `0` disables |
+| `IDLE_SHUTDOWN_MS` | `300000` | Self-stop the machine after this long with zero jobs; `0` disables |
+| `FLY_API_TOKEN` | — | Needed for machine self-stop (idle scale-to-zero) |
 
 ## Guards
 

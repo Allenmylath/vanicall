@@ -11,6 +11,7 @@ A Rust (axum) signaling/API server for WebRTC calls backed by the
 | POST   | `/login`                  | Login/create user, returns a JWT                     |
 | POST   | `/rooms`                  | Create a (logical) room                              |
 | GET    | `/rooms/:id/config`       | Public room config (`name`, `e2ee`) — no auth        |
+| GET    | `/rooms/:id/presence`     | Live human/ingest counts for a room — no auth        |
 | POST   | `/rooms/:id/ingests`      | Mint an external-source publish credential (owner)   |
 | GET    | `/rooms/:id/ingests`      | List a room's ingests (owner)                        |
 | DELETE | `/ingests/:id`            | Revoke an ingest, cutting off any live publish       |
