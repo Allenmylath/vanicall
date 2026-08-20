@@ -1,3 +1,11 @@
+# Neither image needs these, and they dominate the build context: it is uploaded to the Fly builder
+# on every deploy, so leaving them in cost ~1.8 GB and 39k files per build. They are gitignored,
+# but .dockerignore does not inherit from .gitignore — it has to be said again here.
+frontend
+transcript-backend
+samplefrontend
+**/node_modules
+
 target
 .git
 .gitignore
