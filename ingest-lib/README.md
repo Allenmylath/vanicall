@@ -20,10 +20,9 @@ encoder from `whipUrl` / `token`.
 ```ts
 import { Vanicall } from "@vanicall/ingest";
 
-const vc = new Vanicall({
-  baseUrl: "https://vanicall.fly.dev",
-  appUrl: "https://app.vanicall.dev",
-});
+// URLs default to the live deployment — https://vanicall.fly.dev (API) and
+// https://vanicall.shis.ai (app, used for joinUrl). Pass baseUrl/appUrl only to override.
+const vc = new Vanicall();
 await vc.login("camera-service");
 
 const room = await vc.createRoom({ name: "Front door" });
@@ -90,6 +89,7 @@ minting a new ingest and revoking the old one with `revokeIngest`.
 | Method | Notes |
 | --- | --- |
 | `login(name)` | Mints and stores a JWT |
+| `new Vanicall({ baseUrl?, appUrl?, token? })` | All optional; URLs default to the live deployment |
 | `createRoom({ name, e2ee? })` | `e2ee` defaults to `false` |
 | `getRoom(roomId)` | Public; no auth |
 | `listRooms()` / `deleteRoom(roomId)` | Owner-scoped |
@@ -98,3 +98,16 @@ minting a new ingest and revoking the old one with `revokeIngest`.
 | `revokeIngest(ingestId)` | Also cuts off a publish in flight |
 | `ingest.pushRtsp / pushFile / push` | Spawn ffmpeg; return `{ done, stop }` |
 | `ingest.ffmpegCommand(input)` | The command line, as a string |
+
+## Browser use
+
+`Vanicall` spawns ffmpeg, so it is Node-only. The control plane on its own (rooms, ingest
+credentials — everything except publishing) is browser-safe and lives in `src/client.ts`, which has
+no Node imports. Import `VanicallClient` from there, or use the copy vendored into the web app at
+`frontend/src/vanicall-sdk/`.
+
+## Troubleshooting
+
+**`ret=-11` / "UDP send blocked" / publish dies after a few seconds.** The muxer's send buffer is
+too small for the bitrate. The SDK sets `-ts_buffer_size` to 1 MB by default, which covers 1500k;
+raise it with `tsBufferSize` if you push higher bitrates or the link is lossy.

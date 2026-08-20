@@ -1,5 +1,8 @@
 import { spawn } from "node:child_process";
 
+/** See `EncodeOptions.tsBufferSize`. 1 MB — enough headroom for a keyframe burst at 1500k. */
+const DEFAULT_TS_BUFFER_SIZE = 1024 * 1024;
+
 /**
  * Encoder settings for a WHIP publish.
  *
@@ -24,6 +27,15 @@ export type EncodeOptions = {
   keyframeIntervalSec?: number;
   /** Drop audio entirely (video-only feeds such as most RTSP cameras). Default `false`. */
   noAudio?: boolean;
+  /**
+   * Size in bytes of the WHIP muxer's UDP send buffer (`-ts_buffer_size`). Default 1 MB.
+   *
+   * ffmpeg's default is the system socket buffer, which is too small to absorb a keyframe burst at
+   * typical video bitrates: the send blocks, ffmpeg reports `ret=-11` / "UDP send blocked", and the
+   * publish dies seconds after starting. 1 MB is roughly five seconds of headroom at the default
+   * 1500k. Raise it for higher bitrates or lossier links.
+   */
+  tsBufferSize?: number;
   /** Path to the ffmpeg binary. Default `"ffmpeg"` (found on `PATH`). */
   ffmpegPath?: string;
   /**
@@ -71,7 +83,12 @@ export function buildFfmpegArgs(
     args.push("-c:a", "libopus", "-ar", "48000", "-ac", "2", "-b:a", opts.audioBitrate ?? "64k");
   }
 
-  args.push("-f", "whip", "-authorization", token, whipUrl);
+  args.push(
+    "-f", "whip",
+    "-ts_buffer_size", String(opts.tsBufferSize ?? DEFAULT_TS_BUFFER_SIZE),
+    "-authorization", token,
+    whipUrl,
+  );
   return args;
 }
 
