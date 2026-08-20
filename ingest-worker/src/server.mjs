@@ -234,7 +234,7 @@ const server = http.createServer(async (req, res) => {
   const path = url.pathname;
 
   if (path === "/health") {
-    send(res, 200, { status: "ok", jobs: jobs.size });
+    send(res, 200, { status: "ok", jobs: jobs.size, selfStop: selfStopStatus });
     return;
   }
 
@@ -327,8 +327,60 @@ const server = http.createServer(async (req, res) => {
   send(res, 404, { error: "not found" });
 });
 
+/**
+ * Whether idle self-stop can actually work, surfaced in /health so a wrong or missing FLY_API_TOKEN
+ * is caught by a curl at deploy time instead of silently at the first idle window five minutes in.
+ *   armed         — token present and accepted by the Fly API; scale-to-zero will work
+ *   token-invalid — a token is set but the Fly API rejected it (typo / wrong org / bad scope)
+ *   no-token      — running on Fly but FLY_API_TOKEN is unset; will NOT scale down
+ *   off-fly       — not on a Fly machine (local dev); self-stop falls back to process exit
+ *   disabled      — IDLE_SHUTDOWN_MS=0
+ *   checking      — preflight not finished yet
+ */
+let selfStopStatus = "checking";
+
+/**
+ * Preflight the self-stop path at boot: a read-only GET on this machine with the token. It proves
+ * the exact credential and permission the later stop call needs, without stopping anything.
+ */
+async function verifySelfStop() {
+  if (IDLE_SHUTDOWN_MS <= 0) { selfStopStatus = "disabled"; return; }
+
+  const machineId = process.env.FLY_MACHINE_ID;
+  const appName = process.env.FLY_APP_NAME;
+  const token = process.env.FLY_API_TOKEN;
+
+  if (!machineId || !appName) { selfStopStatus = "off-fly"; return; }
+  if (!token) {
+    selfStopStatus = "no-token";
+    console.warn("FLY_API_TOKEN is not set — this worker will NOT scale to zero. See README.");
+    return;
+  }
+  try {
+    const r = await fetch(
+      "https://api.machines.dev/v1/apps/" + appName + "/machines/" + machineId,
+      { headers: { Authorization: "Bearer " + token } },
+    );
+    if (r.ok) {
+      selfStopStatus = "armed";
+      console.log("self-stop armed (FLY_API_TOKEN verified)");
+    } else {
+      selfStopStatus = "token-invalid";
+      console.error(
+        "FLY_API_TOKEN was REJECTED by the Fly API (HTTP " + r.status + ") — self-stop will not " +
+          "work. Recreate it: fly tokens create deploy -a " + appName,
+      );
+    }
+  } catch (e) {
+    // Network hiccup at boot shouldn't be reported as a bad token; leave it to retry via the log.
+    selfStopStatus = "checking";
+    console.warn("self-stop preflight could not reach the Fly API: " + (e && e.message ? e.message : e));
+  }
+}
+
 server.listen(PORT, () => {
   console.log("ingest worker on :" + PORT + "  (publish target: " + VANICALL_API_URL + ")");
+  void verifySelfStop();
 });
 
 // Stop every publish cleanly on shutdown so each sends its WHIP DELETE and the tiles disappear
@@ -362,10 +414,16 @@ async function stopSelfIfIdle() {
   const appName = process.env.FLY_APP_NAME;
   const token = process.env.FLY_API_TOKEN;
 
-  if (!machineId || !appName || !token) {
-    console.log("idle — no Fly machine context; exiting");
+  // Off Fly (local dev): a plain exit is the right "scale to zero".
+  if (!machineId || !appName) {
+    console.log("idle — exiting");
     process.exit(0);
   }
+
+  // On Fly with no usable token, stopping is impossible AND exiting would just restart-loop (Fly
+  // restarts a cleanly-exited service machine every IDLE_SHUTDOWN_MS). Stay up instead; /health
+  // already reports this as no-token / token-invalid so it's visible.
+  if (!token) return;
 
   console.log("idle for " + Math.round(IDLE_SHUTDOWN_MS / 1000) + "s — stopping machine " + machineId);
   try {
@@ -374,7 +432,10 @@ async function stopSelfIfIdle() {
       { method: "POST", headers: { Authorization: "Bearer " + token } },
     );
     // On success Fly stops the machine and this process is killed; reaching here means it didn't.
-    if (!r.ok) console.warn("self-stop failed: HTTP " + r.status + " " + (await r.text()).slice(0, 200));
+    if (!r.ok) {
+      selfStopStatus = "token-invalid";
+      console.warn("self-stop failed: HTTP " + r.status + " " + (await r.text()).slice(0, 200));
+    }
   } catch (e) {
     console.warn("self-stop request errored: " + (e && e.message ? e.message : e));
   }

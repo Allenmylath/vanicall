@@ -52,9 +52,23 @@ fly tokens create deploy -a vanicall-ingest
 fly secrets set -a vanicall-ingest FLY_API_TOKEN=<token>
 ```
 
-Without the token it logs a warning and falls back to `process.exit(0)`, which a `fly deploy`
-machine simply restarts — i.e. it will NOT scale down. Set `IDLE_SHUTDOWN_MS=0` to disable
-(correct when running the worker off Fly, e.g. on a camera's LAN).
+**Setting the secret does not verify it** — `fly secrets set` stores any string, and
+`fly secrets list` only shows a digest. So the worker checks the token at boot (a read-only Fly API
+call) and reports the result in `/health`, letting a wrong token be caught at deploy time instead of
+silently at the first idle window:
+
+```bash
+curl -s https://vanicall-ingest.fly.dev/health
+# { "status": "ok", "jobs": 0, "selfStop": "armed" }
+```
+
+`selfStop` values: `armed` (token works, scale-to-zero will happen), `token-invalid` (a token is set
+but Fly rejected it — recreate it), `no-token` (running on Fly with none — will not scale down),
+`off-fly` (local dev; self-stop falls back to a plain exit), `disabled` (`IDLE_SHUTDOWN_MS=0`).
+
+If the token is missing or invalid the worker stays up rather than exiting, because a cleanly-exited
+Fly service machine just restarts — an exit-loop, not a scale-down. Set `IDLE_SHUTDOWN_MS=0` to
+disable entirely (correct when running the worker off Fly, e.g. on a camera's LAN).
 
 Cold start after an idle period is a few seconds (machine boot; the ffmpeg image layer is already
 cached), then the usual RTSP-connect time. The first `Stream` click after a quiet spell is slower.
