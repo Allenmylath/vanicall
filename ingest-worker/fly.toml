@@ -13,7 +13,7 @@
 # root the context at this directory instead, and the build would fail on the missing ingest-lib.
 
 app = 'vanicall-ingest'
-primary_region = 'bom'
+primary_region = 'sin'
 
 [env]
   PORT = '8090'

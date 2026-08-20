@@ -22,6 +22,19 @@ JWT_SECRET=<same secret the API signs with> npm start
 and point the web app at it with `VITE_INGEST_WORKER_URL=http://localhost:8090`. The app also
 degrades gracefully: with no worker configured it shows a ready-to-paste ffmpeg command instead.
 
+## Exactly one machine
+
+Job state is an in-memory `Map`, so **this app must run a single machine**:
+
+```bash
+fly scale count 1 -a vanicall-ingest
+```
+
+Fly creates two by default. With two, the router round-robins: `GET /jobs/:id` 404s about half the
+time and `DELETE` can land on the machine that isn't running the stream, which then never stops.
+HA would not help regardless — a machine holds live ffmpeg processes, so losing it drops those
+streams either way. Going multi-machine needs shared job state or `fly-replay` routing.
+
 ## Design
 
 Deliberately dumb. It knows nothing about rooms, ownership, or the database. The caller mints an
