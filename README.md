@@ -173,8 +173,18 @@ RECONCILE_INTERVAL_SECS=600 cargo run --bin reconcile
 cargo run --bin reconcile
 ```
 
-On Fly.io it runs automatically as the `reconciler` process group (see
-[`fly.toml`](fly.toml)); no extra command needed after `fly deploy`.
+On Fly.io it runs as a **scheduled machine** (hourly, one-shot) so it costs nothing between runs,
+rather than an always-on loop. Create it once, in the same sitting as the deploy that removes the
+old always-on process group (until you do, billing does not run):
+
+```bash
+fly deploy      # this destroys the old always-on reconciler machine
+fly machine run . /usr/local/bin/reconcile   --schedule hourly --vm-size shared-cpu-1x --vm-memory 512 -a vanicall
+```
+
+Calls are then billed within the hour instead of within 10 minutes. That is harmless — Cloudflare's
+usage analytics settles slowly anyway, which is why each run waits `RECONCILE_SETTLE_SECS` before
+trusting a call's numbers.
 
 **Read a user's bill:**
 
@@ -238,6 +248,7 @@ psql "$DATABASE_URL" -f schema.sql
 fly deploy
 ```
 
-`fly.toml` defines two process groups from one image: `web` (the signaling/REST
-server, listening on `$PORT` with HTTPS/WSS and a `/health` check) and
-`reconciler` (the billing job). Both come up on `fly deploy`.
+`fly.toml` defines the `web` process (the signaling/REST server, on `$PORT`
+with HTTPS/WSS and a `/health` check), which scales to zero when idle. The
+billing reconciler is a separate scheduled machine (see the billing section
+above) rather than a process group, so it too runs only when it has work.

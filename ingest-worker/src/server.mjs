@@ -38,8 +38,26 @@ const RESTART_BASE_MS = 2000;
 const RESTART_MAX_MS = 30000;
 const MAX_RESTARTS = 100;
 
+/**
+ * Scale-to-zero. When the worker has held zero jobs for this long, it stops its own Fly machine so
+ * nothing bills while idle. It wakes on the next request via `auto_start_machines`.
+ *
+ * This is done in the app rather than by Fly's connection-based autostop on purpose: a running
+ * ffmpeg holds no inbound HTTP connection, so Fly would see an idle machine and stop it mid-stream,
+ * killing every live feed. Keying the decision on `jobs.size` instead means a machine only ever
+ * stops when it genuinely has no streams. Set IDLE_SHUTDOWN_MS=0 to disable (e.g. when running the
+ * worker locally, off Fly).
+ */
+const IDLE_SHUTDOWN_MS = Number(process.env.IDLE_SHUTDOWN_MS ?? 5 * 60 * 1000);
+// Poll often enough to notice the idle window promptly, but never more than every 30s in prod.
+const IDLE_CHECK_MS = Math.max(1000, Math.min(30 * 1000, Math.floor(IDLE_SHUTDOWN_MS / 3) || 1000));
+
 /** jobId -> job */
 const jobs = new Map();
+
+/** Epoch ms when the worker last had at least one job (or booted). Drives the idle shutdown. */
+let lastActiveAt = Date.now();
+const markActive = () => { lastActiveAt = Date.now(); };
 
 const nowIso = () => new Date().toISOString();
 
@@ -255,6 +273,7 @@ const server = http.createServer(async (req, res) => {
       startedAt: nowIso(),
     };
     jobs.set(job.jobId, job);
+    markActive();
     console.log("[" + job.jobId + "] publishing " + redactRtsp(rtspUrl) + " -> " + whipUrl);
     startFfmpeg(job);
     send(res, 202, publicJob(job));
@@ -305,3 +324,44 @@ for (const sig of ["SIGINT", "SIGTERM"]) {
     setTimeout(() => process.exit(0), 1500);
   });
 }
+
+// ---------------- Scale to zero ----------------
+
+/**
+ * Stop this Fly machine when it has been idle long enough. Fly then keeps it stopped until a
+ * request arrives (auto_start_machines), so an idle worker costs nothing.
+ *
+ * Uses the Fly Machines API rather than process.exit(): a machine deployed via `fly deploy`
+ * restarts its process on exit, which would just loop instead of scaling down. Stopping the
+ * machine is the operation that actually parks it. FLY_MACHINE_ID and FLY_APP_NAME are injected by
+ * Fly; FLY_API_TOKEN must be provided as a secret. Off Fly (local dev), none of that is set and
+ * this falls back to a plain exit.
+ */
+async function stopSelfIfIdle() {
+  if (IDLE_SHUTDOWN_MS <= 0) return;
+  if (jobs.size > 0) { markActive(); return; }
+  if (Date.now() - lastActiveAt < IDLE_SHUTDOWN_MS) return;
+
+  const machineId = process.env.FLY_MACHINE_ID;
+  const appName = process.env.FLY_APP_NAME;
+  const token = process.env.FLY_API_TOKEN;
+
+  if (!machineId || !appName || !token) {
+    console.log("idle — no Fly machine context; exiting");
+    process.exit(0);
+  }
+
+  console.log("idle for " + Math.round(IDLE_SHUTDOWN_MS / 1000) + "s — stopping machine " + machineId);
+  try {
+    const r = await fetch(
+      "https://api.machines.dev/v1/apps/" + appName + "/machines/" + machineId + "/stop",
+      { method: "POST", headers: { Authorization: "Bearer " + token } },
+    );
+    // On success Fly stops the machine and this process is killed; reaching here means it didn't.
+    if (!r.ok) console.warn("self-stop failed: HTTP " + r.status + " " + (await r.text()).slice(0, 200));
+  } catch (e) {
+    console.warn("self-stop request errored: " + (e && e.message ? e.message : e));
+  }
+}
+
+setInterval(() => { void stopSelfIfIdle(); }, IDLE_CHECK_MS).unref();

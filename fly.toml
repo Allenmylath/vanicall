@@ -11,13 +11,24 @@ primary_region = 'bom'
 
 [env]
   PORT = '8080'
-  RECONCILE_INTERVAL_SECS = '600'
+  # No RECONCILE_INTERVAL_SECS: the reconciler runs ONE pass and exits (one-shot), because it is a
+  # scheduled machine now, not an always-on loop — see the [processes] note below. RECONCILE_SETTLE
+  # still applies to each run.
   RECONCILE_SETTLE_SECS = '300'
   RUST_LOG = 'info,tower_http=info'
 
 [processes]
-  reconciler = 'reconcile'
   web = 'vanicall'
+
+# The reconciler is NOT a process group here anymore. As a process group it was an always-on loop
+# (RECONCILE_INTERVAL_SECS) — a machine running while nothing happened. It is now a SCHEDULED
+# machine that wakes hourly, bills whatever ended, and stops, so it costs nothing between runs.
+# It is created once, separately from `fly deploy`, and reuses this app's image and env:
+#
+#   fly machine run . /usr/local/bin/reconcile #     --schedule hourly --vm-size shared-cpu-1x --vm-memory 512 -a vanicall
+#
+# WARNING: `fly deploy` with this config DESTROYS the old always-on reconciler machine. Billing
+# does not run again until the scheduled machine above is created. Do both in the same sitting.
 
 [http_service]
   internal_port = 8080
@@ -53,9 +64,3 @@ primary_region = 'bom'
   size = 'shared-cpu-2x'
   memory = '1gb'
   processes = ['web']
-
-# The reconciler is a periodic background loop — keep it tiny.
-[[vm]]
-  size = 'shared-cpu-1x'
-  memory = '512mb'
-  processes = ['reconciler']

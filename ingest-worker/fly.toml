@@ -25,11 +25,18 @@ primary_region = 'sin'
 [http_service]
   internal_port = 8090
   force_https = true
-  # A running stream is state this machine holds; stopping it kills every feed. Unlike the
-  # signaling server, this cannot scale to zero while it has work.
-  auto_stop_machines = false
+  # Scale to zero, but NOT via Fly's connection-based autostop: a running ffmpeg holds no inbound
+  # HTTP connection, so Fly would read the machine as idle and stop it mid-stream, killing every
+  # feed. So autostop is OFF, and the worker instead stops its OWN machine (Machines API) only once
+  # jobs.size hits zero for IDLE_SHUTDOWN_MS — see src/server.mjs. auto_start wakes it on the next
+  # request. Net effect: nothing runs while idle, and a live stream is never cut.
+  #
+  # Self-stop needs a FLY_API_TOKEN secret (FLY_MACHINE_ID / FLY_APP_NAME are injected by Fly):
+  #   fly tokens create deploy -a vanicall-ingest        # or an org token
+  #   fly secrets set -a vanicall-ingest FLY_API_TOKEN=<token>
+  auto_stop_machines = 'off'
   auto_start_machines = true
-  min_machines_running = 1
+  min_machines_running = 0
 
   [[http_service.checks]]
     interval = '15s'

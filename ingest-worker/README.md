@@ -35,6 +35,30 @@ time and `DELETE` can land on the machine that isn't running the stream, which t
 HA would not help regardless — a machine holds live ffmpeg processes, so losing it drops those
 streams either way. Going multi-machine needs shared job state or `fly-replay` routing.
 
+## Scales to zero
+
+An idle worker stops its own Fly machine after `IDLE_SHUTDOWN_MS` (default 5 min) with zero jobs,
+and `auto_start_machines` wakes it on the next request — so nothing bills while no one is streaming.
+
+It self-stops rather than leaning on Fly's autostop because a running ffmpeg holds no inbound HTTP
+connection: Fly would read the machine as idle and stop it mid-stream, killing live feeds. Keying
+on `jobs.size` instead means a machine only ever stops when it genuinely has no streams.
+
+Self-stop calls the Fly Machines API, so it needs a token (the injected `FLY_MACHINE_ID` /
+`FLY_APP_NAME` are not enough):
+
+```bash
+fly tokens create deploy -a vanicall-ingest
+fly secrets set -a vanicall-ingest FLY_API_TOKEN=<token>
+```
+
+Without the token it logs a warning and falls back to `process.exit(0)`, which a `fly deploy`
+machine simply restarts — i.e. it will NOT scale down. Set `IDLE_SHUTDOWN_MS=0` to disable
+(correct when running the worker off Fly, e.g. on a camera's LAN).
+
+Cold start after an idle period is a few seconds (machine boot; the ffmpeg image layer is already
+cached), then the usual RTSP-connect time. The first `Stream` click after a quiet spell is slower.
+
 ## Design
 
 Deliberately dumb. It knows nothing about rooms, ownership, or the database. The caller mints an
