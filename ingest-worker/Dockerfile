@@ -4,9 +4,13 @@
 
 FROM node:22-bookworm-slim AS ffmpeg
 # Debian bookworm ships ffmpeg 5.1, which has NO WHIP muxer — `apt-get install ffmpeg` yields a
-# worker that cannot publish at all. Pull a static build instead. Pinned rather than :latest so a
-# rebuild can't silently swap the encoder underneath a working deployment.
-ARG FFMPEG_URL=https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2025-01-01-12-56/ffmpeg-n7.1-latest-linux64-gpl-7.1.tar.xz
+# worker that cannot publish at all. Pull a static build instead.
+#
+# Pinned to the release series (n8.1), not to a dated autobuild tag: BtbN deletes old autobuild
+# tags, so a dated URL eventually 404s and breaks rebuilds of an otherwise untouched deployment.
+# This asset name is stable and stays on 8.1.x, which is the version the ingest path was verified
+# against. Bump deliberately; the assertion below is what stops a bad swap reaching production.
+ARG FFMPEG_URL=https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-linux64-gpl-8.1.tar.xz
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl xz-utils ca-certificates \
     && rm -rf /var/lib/apt/lists/* \

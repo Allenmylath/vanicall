@@ -92,9 +92,17 @@ fly scale vm shared-cpu-4x --memory 2048 -a vanicall-ingest   # then raise MAX_J
 
 ### ffmpeg version
 
-The image pulls a **static ffmpeg 7.1 build**, not Debian's. Bookworm ships 5.1, which has no WHIP
+The image pulls a **static ffmpeg 8.1 build**, not Debian's. Bookworm ships 5.1, which has no WHIP
 muxer at all — `apt-get install ffmpeg` produces a worker that cannot publish. The Dockerfile
 asserts the muxer is present at build time so this fails loudly rather than at runtime.
+
+`FFMPEG_URL` points at BtbN's `latest` release tag, pinned to the **n8.1 series** rather than to a
+dated autobuild tag: those get deleted, so a dated URL eventually 404s and breaks the build of an
+otherwise untouched deployment. Override it if you need a different version:
+
+```bash
+fly deploy -c ingest-worker/fly.toml --dockerfile ingest-worker/Dockerfile   --build-arg FFMPEG_URL=<url> .
+```
 
 ### Why a separate Fly app
 
