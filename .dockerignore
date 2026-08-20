@@ -1,11 +1,17 @@
 target
 .git
 .gitignore
-# Control-plane client library — published to npm, never part of the server image.
-ingest-lib
 .env
 .dockerignore
 Dockerfile
 fly.toml
 README.md
 **/*.md
+
+# The Node projects share this build context with the Rust image. Exclude only their build output
+# and dependencies — the sources themselves must stay, because the ingest-worker image builds
+# ingest-lib from source and both are built with the repo root as context.
+ingest-lib/node_modules
+ingest-lib/dist
+ingest-lib/*.tgz
+ingest-worker/node_modules

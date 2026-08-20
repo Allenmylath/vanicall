@@ -36,7 +36,7 @@ export {
   type RoomSummary,
   type IngestSummary,
 } from "./client.js";
-export { buildFfmpegArgs, type EncodeOptions, type Publish } from "./ffmpeg.js";
+export { buildFfmpegArgs, spawnPublish, type EncodeOptions, type Publish } from "./ffmpeg.js";
 
 /** A minted publish credential, plus helpers that drive ffmpeg against it. */
 export class Ingest extends IngestHandle {

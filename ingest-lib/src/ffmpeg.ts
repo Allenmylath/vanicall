@@ -36,6 +36,14 @@ export type EncodeOptions = {
    * 1500k. Raise it for higher bitrates or lossier links.
    */
   tsBufferSize?: number;
+  /**
+   * Emit periodic `frame=... speed=...` progress lines on stderr (`-stats`). Default false.
+   *
+   * `-loglevel warning` otherwise suppresses them entirely, which matters if you use `onLog` to
+   * tell "connected and sending" apart from "still negotiating" — without this there is no
+   * positive signal that media is actually flowing, only the absence of errors.
+   */
+  stats?: boolean;
   /** Path to the ffmpeg binary. Default `"ffmpeg"` (found on `PATH`). */
   ffmpegPath?: string;
   /**
@@ -62,6 +70,7 @@ export function buildFfmpegArgs(
   const gop = Math.max(1, Math.round(fps * (opts.keyframeIntervalSec ?? 2)));
 
   const args: string[] = ["-hide_banner", "-loglevel", "warning"];
+  if (opts.stats) args.push("-stats");
   if (opts.realtime) args.push("-re");
   args.push(...(opts.inputArgs ?? []), "-i", input);
 

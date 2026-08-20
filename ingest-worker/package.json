@@ -1,0 +1,17 @@
+{
+  "name": "vanicall-ingest-worker",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Pulls RTSP sources and republishes them into vanicall rooms over WHIP.",
+  "type": "module",
+  "main": "src/server.mjs",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "dev": "node --watch src/server.mjs"
+  },
+  "dependencies": {
+    "@vanicall/ingest": "file:../ingest-lib",
+    "jsonwebtoken": "^9.0.2"
+  }
+}

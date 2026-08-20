@@ -7,3 +7,4 @@
 ingest-lib/node_modules
 ingest-lib/dist
 ingest-lib/*.tgz
+ingest-worker/node_modules

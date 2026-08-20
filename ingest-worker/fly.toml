@@ -1,0 +1,41 @@
+# Separate Fly app from the signaling server on purpose.
+#
+# The main `vanicall` app is a deliberately small JSON relay (shared-cpu-2x/1gb) with
+# auto_stop_machines enabled — it does no media and no crypto. ffmpeg is the opposite: sustained
+# CPU, and a machine that must not be stopped while a stream is open. Putting it in that app would
+# undo the right-sizing and let autostop kill live feeds.
+#
+# Deploy from the REPO ROOT (the image needs ../ingest-lib):
+#   fly deploy -c ingest-worker/fly.toml --dockerfile ingest-worker/Dockerfile .
+
+app = 'vanicall-ingest'
+primary_region = 'bom'
+
+[build]
+  dockerfile = 'Dockerfile'
+
+[env]
+  PORT = '8090'
+  VANICALL_API_URL = 'https://vanicall.fly.dev'
+  MAX_JOBS = '4'
+
+[http_service]
+  internal_port = 8090
+  force_https = true
+  # A running stream is state this machine holds; stopping it kills every feed. Unlike the
+  # signaling server, this cannot scale to zero while it has work.
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    interval = '15s'
+    timeout = '2s'
+    grace_period = '10s'
+    method = 'GET'
+    path = '/health'
+
+# Each concurrent stream is a real ffmpeg transcode. Size for MAX_JOBS, not for idle.
+[[vm]]
+  size = 'shared-cpu-2x'
+  memory = '2gb'
