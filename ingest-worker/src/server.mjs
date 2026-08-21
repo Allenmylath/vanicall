@@ -28,6 +28,15 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS ?? "*").split(",").map((s) 
 /** A ceiling on concurrent ffmpeg processes, since each is real CPU on a small VM. */
 const MAX_JOBS = Number(process.env.MAX_JOBS ?? 4);
 
+/**
+ * This machine's Fly id (injected by Fly; empty off-Fly). Job ids are prefixed with it so any
+ * machine receiving a /jobs/:id request can tell whether it owns that job, and if not, bounce the
+ * request to the owner with a `fly-replay` header. That is what lets the worker run as a POOL of
+ * small machines — Fly's load balancer spreads requests across them, and this stateless routing
+ * makes status/stop still reach the right one without a shared database.
+ */
+const MACHINE_ID = process.env.FLY_MACHINE_ID || "local";
+
 if (!JWT_SECRET) {
   console.error("JWT_SECRET is required (the same secret the vanicall API signs with)");
   process.exit(1);
@@ -268,12 +277,16 @@ const server = http.createServer(async (req, res) => {
 
     const live = Array.from(jobs.values()).filter((j) => !j.stopped).length;
     if (live >= MAX_JOBS) {
+      // This machine is full. Ask Fly to replay the publish on a DIFFERENT instance, so a pool
+      // absorbs the load instead of 429ing at MAX_JOBS per machine. If every machine is full Fly
+      // exhausts its replay budget and the client finally gets this 429 — the true global limit.
+      if (MACHINE_ID !== "local") res.setHeader("fly-replay", "elsewhere=true");
       send(res, 429, { error: "worker at capacity (" + MAX_JOBS + " concurrent streams)" });
       return;
     }
 
     const job = {
-      jobId: randomUUID(),
+      jobId: MACHINE_ID + "." + randomUUID(),
       name: typeof name === "string" && name ? name : "RTSP source",
       rtspUrl,
       whipUrl,
@@ -302,10 +315,24 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  const jobMatch = path.match(/^\/jobs\/([0-9a-fA-F-]{36})$/);
+  // Job ids are "<machineId>.<uuid>" (or a bare uuid from an older client / local run).
+  const jobMatch = path.match(/^\/jobs\/((?:[a-zA-Z0-9]+\.)?[0-9a-fA-F-]{36})$/);
   if (jobMatch) {
     if (!authed(req, res)) return;
-    const job = jobs.get(jobMatch[1]);
+    const jobId = jobMatch[1];
+
+    // If the id names a different machine, let Fly replay the request there. This is what makes
+    // status/stop work across a pool: whichever machine the load balancer picked forwards to the
+    // owner. `.` present but not our id => not ours; no `.` => a legacy/local id we treat as ours.
+    const dot = jobId.indexOf(".");
+    const owner = dot > 0 ? jobId.slice(0, dot) : MACHINE_ID;
+    if (owner !== MACHINE_ID && MACHINE_ID !== "local") {
+      res.setHeader("fly-replay", "instance=" + owner);
+      send(res, 409, { error: "replaying to owning machine" });
+      return;
+    }
+
+    const job = jobs.get(jobId);
     if (!job) {
       send(res, 404, { error: "no such job" });
       return;

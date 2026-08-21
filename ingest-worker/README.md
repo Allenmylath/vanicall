@@ -22,18 +22,31 @@ JWT_SECRET=<same secret the API signs with> npm start
 and point the web app at it with `VITE_INGEST_WORKER_URL=http://localhost:8090`. The app also
 degrades gracefully: with no worker configured it shows a ready-to-paste ffmpeg command instead.
 
-## Exactly one machine
+## Scaling out (multiple machines)
 
-Job state is an in-memory `Map`, so **this app must run a single machine**:
+Each machine handles `MAX_JOBS` concurrent streams (2 on `shared-cpu-2x`, since every stream is an
+H.264 transcode). To handle more, run **more machines** rather than a bigger one:
 
 ```bash
-fly scale count 1 -a vanicall-ingest
+fly scale count 3 -a vanicall-ingest   # up to 3 x MAX_JOBS concurrent streams
 ```
 
-Fly creates two by default. With two, the router round-robins: `GET /jobs/:id` 404s about half the
-time and `DELETE` can land on the machine that isn't running the stream, which then never stops.
-HA would not help regardless — a machine holds live ffmpeg processes, so losing it drops those
-streams either way. Going multi-machine needs shared job state or `fly-replay` routing.
+Job state is an in-memory `Map` per machine, but the worker routes across the pool with no shared
+database, using Fly's `fly-replay`:
+
+- Job ids are `<machineId>.<uuid>`. A `GET`/`DELETE /jobs/:id` that Fly's load balancer sends to
+  the wrong machine is bounced to the owner with `fly-replay: instance=<machineId>` — transparent
+  to the client.
+- A machine already at `MAX_JOBS` answers `POST /publish` with `fly-replay: elsewhere=true`, so Fly
+  retries on another machine. Only when every machine is full does the caller get the `429`.
+
+Combined with scale-to-zero, this is a pool where idle machines stop and load wakes more: set the
+count to your ceiling and pay only for what's streaming. `fly scale count 1` still works and behaves
+exactly as before.
+
+Caveat: `fly-replay` behaviour (instance routing, `elsewhere`, waking a stopped instance) is Fly
+proxy behaviour that can only be confirmed on a real multi-machine deploy — the routing *decision*
+is unit-tested, but verify end to end after `fly scale count > 1`.
 
 ## Scales to zero
 
